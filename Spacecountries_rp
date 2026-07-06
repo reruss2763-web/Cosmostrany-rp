@@ -1,0 +1,566 @@
+import asyncio
+import os
+import sqlite3
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message
+
+# ========== КОНФИГУРАЦИЯ ==========
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN is not set. Add it as a secret in the Replit environment."
+    )
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "space_economy.db")
+
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+
+# ========== МИГРАЦИЯ СТАРОЙ БАЗЫ ==========
+def migrate_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    existing_tables = {row[0] for row in c.fetchall()}
+
+    if "countries" in existing_tables:
+        c.execute("PRAGMA table_info(countries)")
+        country_cols = {row[1] for row in c.fetchall()}
+        for col, ddl in [
+            ("primary_sector", "ALTER TABLE countries ADD COLUMN primary_sector INTEGER DEFAULT 1"),
+            ("last_collect", "ALTER TABLE countries ADD COLUMN last_collect TIMESTAMP"),
+            ("last_city_add", "ALTER TABLE countries ADD COLUMN last_city_add TIMESTAMP"),
+            ("last_flag_set", "ALTER TABLE countries ADD COLUMN last_flag_set TIMESTAMP"),
+            ("selected_resources", "ALTER TABLE countries ADD COLUMN selected_resources TEXT"),
+            ("last_population_update", "ALTER TABLE countries ADD COLUMN last_population_update TIMESTAMP"),
+            ("population", "ALTER TABLE countries ADD COLUMN population REAL DEFAULT 200"),
+        ]:
+            if col not in country_cols:
+                c.execute(ddl)
+
+    if "cities" in existing_tables:
+        c.execute("PRAGMA table_info(cities)")
+        city_cols = {row[1] for row in c.fetchall()}
+        if "is_capital" not in city_cols:
+            c.execute("ALTER TABLE cities ADD COLUMN is_capital INTEGER DEFAULT 0")
+            c.execute(
+                """UPDATE cities SET is_capital = 1
+                   WHERE id IN (SELECT MIN(id) FROM cities GROUP BY country_id)"""
+            )
+        if "industries" not in city_cols:
+            c.execute("ALTER TABLE cities ADD COLUMN industries TEXT DEFAULT ''")
+            if "countries" in existing_tables:
+                c.execute("PRAGMA table_info(countries)")
+                country_cols_now = {row[1] for row in c.fetchall()}
+                if "selected_resources" in country_cols_now:
+                    c.execute(
+                        "SELECT id, selected_resources FROM countries WHERE selected_resources IS NOT NULL AND selected_resources != ''"
+                    )
+                    countries_with_resources = c.fetchall()
+                    for country_id, sel_res in countries_with_resources:
+                        c.execute(
+                            "SELECT id FROM cities WHERE country_id=? AND is_capital=1",
+                            (country_id,),
+                        )
+                        capital_row = c.fetchone()
+                        if not capital_row:
+                            c.execute(
+                                "SELECT id FROM cities WHERE country_id=? ORDER BY id LIMIT 1",
+                                (country_id,),
+                            )
+                            capital_row = c.fetchone()
+                        if capital_row:
+                            c.execute(
+                                "UPDATE cities SET industries=? WHERE id=?",
+                                (sel_res, capital_row[0]),
+                            )
+
+    if "resources" in existing_tables:
+        c.execute("PRAGMA table_info(resources)")
+        resource_cols = {row[1] for row in c.fetchall()}
+        if "resource_name" not in resource_cols:
+            # Old schema: resources(country_id PK, iron, titanium, adamantium)
+            c.execute("SELECT country_id, iron, titanium, adamantium FROM resources")
+            old_rows = c.fetchall()
+            c.execute("ALTER TABLE resources RENAME TO resources_old")
+            c.execute(
+                """CREATE TABLE resources (
+                    country_id INTEGER,
+                    resource_name TEXT,
+                    amount REAL DEFAULT 0,
+                    PRIMARY KEY (country_id, resource_name),
+                    FOREIGN KEY (country_id) REFERENCES countries(id) ON DELETE CASCADE
+                )"""
+            )
+            for country_id, iron, titanium, adamantium in old_rows:
+                c.execute(
+                    "INSERT OR IGNORE INTO resources (country_id, resource_name, amount) VALUES (?,?,?)",
+                    (country_id, "iron", iron or 0),
+                )
+                c.execute(
+                    "INSERT OR IGNORE INTO resources (country_id, resource_name, amount) VALUES (?,?,?)",
+                    (country_id, "titanium", titanium or 0),
+                )
+            c.execute("DROP TABLE resources_old")
+
+    conn.commit()
+    conn.close()
+
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            registered_at TIMESTAMP
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS countries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            flag_file_id TEXT,
+            is_active INTEGER DEFAULT 0,
+            created_at TIMESTAMP,
+            primary_sector INTEGER DEFAULT 1,
+            last_collect TIMESTAMP,
+            last_city_add TIMESTAMP,
+            last_flag_set TIMESTAMP,
+            last_population_update TIMESTAMP,
+            selected_resources TEXT,
+            population REAL DEFAULT 200,
+            UNIQUE(user_id, name)
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS cities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_id INTEGER NOT NULL,
+            city_name TEXT NOT NULL,
+            population REAL DEFAULT 10,
+            is_capital INTEGER DEFAULT 0,
+            industries TEXT DEFAULT '',
+            FOREIGN KEY (country_id) REFERENCES countries(id) ON DELETE CASCADE,
+            UNIQUE(country_id, city_name)
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS resources (
+            country_id INTEGER,
+            resource_name TEXT,
+            amount REAL DEFAULT 0,
+            PRIMARY KEY (country_id, resource_name),
+            FOREIGN KEY (country_id) REFERENCES countries(id) ON DELETE CASCADE
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS sell_percent (
+            country_id INTEGER,
+            resource_name TEXT,
+            percent INTEGER DEFAULT 50,
+            PRIMARY KEY (country_id, resource_name),
+            FOREIGN KEY (country_id) REFERENCES countries(id) ON DELETE CASCADE
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS money (
+            country_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0,
+            FOREIGN KEY (country_id) REFERENCES countries(id) ON DELETE CASCADE
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def get_active_country(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, name, last_collect, last_city_add, last_flag_set, "
+        "last_population_update, population "
+        "FROM countries WHERE user_id=? AND is_active=1",
+        (user_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_country_by_id(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, name, population, primary_sector FROM countries WHERE id=?", (cid,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_country_name(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name FROM countries WHERE id=?", (cid,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def can_do_action(last_time, hours=10):
+    if not last_time:
+        return True
+    last = datetime.fromisoformat(last_time)
+    return (datetime.now() - last) >= timedelta(hours=hours)
+
+
+def get_city_count(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM cities WHERE country_id=?", (cid,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_population(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT population FROM countries WHERE id=?", (cid,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+
+def set_population(cid, pop):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE countries SET population=? WHERE id=?", (pop, cid))
+    conn.commit()
+    conn.close()
+
+
+def get_country_cities(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, city_name, population, is_capital, industries FROM cities WHERE country_id=?",
+        (cid,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def update_city_population(city_id, new_pop):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE cities SET population=? WHERE id=?", (new_pop, city_id))
+    conn.commit()
+    conn.close()
+
+
+def distribute_population(cid, total_pop):
+    """Распределяет население по городам пропорционально их текущей доле."""
+    cities = get_country_cities(cid)
+    if not cities:
+        return
+    current_sum = sum(c[2] for c in cities)
+    if current_sum == 0:
+        per_city = total_pop / len(cities)
+        for city_id, _, _, _, _ in cities:
+            update_city_population(city_id, per_city)
+        return
+    for city_id, city_name, city_pop, is_capital, _ in cities:
+        new_pop = total_pop * (city_pop / current_sum)
+        update_city_population(city_id, new_pop)
+
+
+def format_number(num):
+    if num >= 1e12:
+        return f"{num / 1e12:.2f} трлн"
+    elif num >= 1e9:
+        return f"{num / 1e9:.2f} млрд"
+    elif num >= 1e6:
+        return f"{num / 1e6:.2f} млн"
+    elif num >= 1e3:
+        return f"{num / 1e3:.2f} тыс"
+    else:
+        return f"{num:.2f}"
+
+
+# ========== КОМАНДЫ ==========
+@router.message(Command("new_country"))
+async def new_country(msg: Message, command: CommandObject):
+    uid = msg.from_user.id
+    name = (command.args or "").strip()
+    if not name:
+        await msg.answer("❌ Укажите название: `/new_country Название`")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM countries WHERE user_id=?", (uid,))
+    if c.fetchone()[0] >= 3:
+        await msg.answer("❌ Не более 3 стран.")
+        conn.close()
+        return
+    c.execute("SELECT 1 FROM countries WHERE user_id=? AND name=?", (uid, name))
+    if c.fetchone():
+        await msg.answer("❌ Такое название уже есть.")
+        conn.close()
+        return
+    now = datetime.now().isoformat()
+    is_active = (
+        1
+        if c.execute(
+            "SELECT COUNT(*) FROM countries WHERE user_id=?", (uid,)
+        ).fetchone()[0]
+        == 0
+        else 0
+    )
+    c.execute(
+        "INSERT INTO countries (user_id, name, is_active, created_at, last_population_update, population) "
+        "VALUES (?,?,?,?,?,200)",
+        (uid, name, is_active, now, now),
+    )
+    cid = c.lastrowid
+    c.execute(
+        "INSERT INTO cities (country_id, city_name, population, is_capital, industries) VALUES (?,?,?,?,?)",
+        (cid, name, 10, 1, ""),
+    )
+    conn.commit()
+    conn.close()
+    await msg.answer(
+        f"✅ Страна **{name}** создана!\n"
+        f"Население: 200 млрд (столица: 10 млрд)\n\n"
+        f"🏙️ **Столица '{name}' создана автоматически.**\n"
+        f"Теперь можно добавлять новые города командой `/add_city`."
+        + ("" if is_active else "\n\nАктивируйте `/select Название`")
+    )
+
+
+@router.message(Command("countries"))
+async def list_countries(msg: Message):
+    uid = msg.from_user.id
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT name, is_active, flag_file_id FROM countries WHERE user_id=?", (uid,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await msg.answer("Нет стран. Создайте: `/new_country Название`")
+        return
+    text = "🗺️ **Ваши страны:**\n"
+    for name, active, flag in rows:
+        status = "✅ активна" if active else "⏺ неактивна"
+        flag_emoji = "🚩" if flag else "⬜"
+        text += f"{flag_emoji} {name} — {status}\n"
+    await msg.answer(text)
+
+
+@router.message(Command("select"))
+async def select_country(msg: Message, command: CommandObject):
+    uid = msg.from_user.id
+    name = (command.args or "").strip()
+    if not name:
+        await msg.answer("❌ Укажите название: `/select Название`")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE countries SET is_active=0 WHERE user_id=?", (uid,))
+    c.execute(
+        "UPDATE countries SET is_active=1 WHERE user_id=? AND name=?", (uid, name)
+    )
+    if c.rowcount == 0:
+        await msg.answer("❌ Страна не найдена.")
+        conn.close()
+        return
+    conn.commit()
+    conn.close()
+    await msg.answer(f"✅ Активная страна: **{name}**")
+
+
+@router.message(Command("flag"), F.photo)
+async def set_flag(msg: Message):
+    uid = msg.from_user.id
+    active = get_active_country(uid)
+    if not active:
+        await msg.answer("❌ Нет активной страны.")
+        return
+    cid, cname, _, _, last_flag, _, _ = active
+    if not can_do_action(last_flag, 10):
+        next_time = datetime.fromisoformat(last_flag) + timedelta(hours=10)
+        remain = next_time - datetime.now()
+        h = int(remain.total_seconds() // 3600)
+        m = int((remain.total_seconds() % 3600) // 60)
+        await msg.answer(f"⏳ Ждите {h} ч {m} мин до смены флага.")
+        return
+    photo = msg.photo[-1]
+    file_id = photo.file_id
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute(
+        "UPDATE countries SET flag_file_id=?, last_flag_set=? WHERE id=?",
+        (file_id, now, cid),
+    )
+    conn.commit()
+    conn.close()
+    await msg.answer(f"✅ Флаг для **{cname}** установлен!")
+
+
+@router.message(Command("add_city"))
+async def add_city(msg: Message, command: CommandObject):
+    uid = msg.from_user.id
+    active = get_active_country(uid)
+    if not active:
+        await msg.answer("❌ Нет активной страны.")
+        return
+    cid, cname, _, last_city, _, _, _ = active
+    if not can_do_action(last_city, 10):
+        next_time = datetime.fromisoformat(last_city) + timedelta(hours=10)
+        remain = next_time - datetime.now()
+        h = int(remain.total_seconds() // 3600)
+        m = int((remain.total_seconds() % 3600) // 60)
+        await msg.answer(f"⏳ Ждите {h} ч {m} мин до следующего города.")
+        return
+    city_name = (command.args or "").strip()
+    if not city_name:
+        await msg.answer("❌ Укажите название: `/add_city Город`")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT 1 FROM cities WHERE country_id=? AND city_name=?", (cid, city_name)
+    )
+    if c.fetchone():
+        await msg.answer("❌ Город уже есть.")
+        conn.close()
+        return
+    now = datetime.now().isoformat()
+    c.execute(
+        "INSERT INTO cities (country_id, city_name, population, is_capital, industries) VALUES (?,?,1,0,?)",
+        (cid, city_name, ""),
+    )
+    c.execute("UPDATE countries SET last_city_add=? WHERE id=?", (now, cid))
+    conn.commit()
+    conn.close()
+    total_pop = get_population(cid)
+    distribute_population(cid, total_pop)
+    await msg.answer(f"🏙️ Город **{city_name}** добавлен в **{cname}**!")
+
+
+@router.message(Command("cities"))
+async def list_cities(msg: Message):
+    uid = msg.from_user.id
+    active = get_active_country(uid)
+    if not active:
+        await msg.answer("❌ Нет активной страны.")
+        return
+    cid, cname, _, _, _, _, _ = active
+    cities = get_country_cities(cid)
+    if not cities:
+        await msg.answer(f"В **{cname}** нет городов.")
+        return
+    text = f"🏙️ **Города {cname}:**\n\n"
+    for city_id, city_name, pop, capital, _ in cities:
+        cap = "⭐ " if capital else ""
+        text += f"{cap}**{city_name}** — {format_number(pop * 1e9)} чел.\n"
+    await msg.answer(text)
+
+
+@router.message(Command("profile"))
+async def profile(msg: Message):
+    uid = msg.from_user.id
+    active = get_active_country(uid)
+    if not active:
+        await msg.answer("❌ Нет активной страны.")
+        return
+    cid, cname, _, _, _, _, pop = active
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT flag_file_id FROM countries WHERE id=?", (cid,))
+    (flag,) = c.fetchone()
+    conn.close()
+    city_count = get_city_count(cid)
+    caption = (
+        f"🏛️ **{cname}**\n"
+        f"👨‍👩‍👧‍👦 Население: {format_number(pop * 1e9)} чел. ({pop:.2f} млрд)\n"
+        f"🏙️ Городов: {city_count}\n"
+    )
+    if flag:
+        await msg.answer_photo(photo=flag, caption=caption)
+    else:
+        await msg.answer(caption)
+
+
+@router.message(Command("delete_country"))
+async def delete_country(msg: Message, command: CommandObject):
+    uid = msg.from_user.id
+    name = (command.args or "").strip()
+    if not name:
+        await msg.answer("❌ Укажите название: `/delete_country Название`")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, is_active FROM countries WHERE user_id=? AND name=?", (uid, name)
+    )
+    row = c.fetchone()
+    if not row:
+        await msg.answer("❌ Страна не найдена.")
+        conn.close()
+        return
+    cid, is_active = row
+    if is_active:
+        c.execute("UPDATE countries SET is_active=0 WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM countries WHERE id=?", (cid,))
+    conn.commit()
+    conn.close()
+    await msg.answer(f"✅ Страна **{name}** удалена.")
+
+
+@router.message(Command("start", "help"))
+async def start_help(msg: Message):
+    await msg.answer(
+        "👋 **Космические страны**\n\n"
+        "**Команды:**\n"
+        "• `/new_country <название>` — создать страну (макс. 3), столица создаётся автоматически\n"
+        "• `/add_city <название>` — добавить город (раз в 10 ч)\n"
+        "• `/cities` — список городов\n"
+        "• `/countries` — список стран\n"
+        "• `/select <название>` — выбрать активную\n"
+        "• `/flag` (с фото) — установить флаг (раз в 10 ч)\n"
+        "• `/profile` — информация о стране\n"
+        "• `/delete_country <название>` — удалить страну\n\n"
+        "**Население:** 200 млрд изначально (столица: 10 млрд). При добавлении города оно распределяется пропорционально между городами.\n"
+        "🚀 Удачи!"
+    )
+
+
+# ========== ЗАПУСК ==========
+async def main():
+    migrate_db()
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    print(f"Bot @{me.username} is up and polling for updates...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
